@@ -879,6 +879,7 @@ nl_langinfo_l
 nrand48
 ntohl
 ntohs
+num_preopens
 open
 open_memstream
 open_wmemstream

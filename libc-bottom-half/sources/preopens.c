@@ -27,7 +27,8 @@ typedef struct preopen {
 /// A simple growable array of `preopen`.
 static _Atomic _Bool preopens_populated = false;
 static preopen *preopens;
-static size_t num_preopens;
+// huyage static size_t num_preopens;
+size_t num_preopens;
 static size_t preopen_capacity;
 
 /// Access to the the above preopen must be protected in the presence of
