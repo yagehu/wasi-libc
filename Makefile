@@ -28,8 +28,14 @@ BUILD_LIBC_TOP_HALF ?= yes
 # yes or no
 BUILD_LIBSETJMP ?= yes
 
-# Set the default WASI target triple.
-TARGET_TRIPLE ?= wasm32-wasi
+ifndef ARCH
+	# Set the default WASI target triple.
+	TARGET_TRIPLE ?= wasm32-wasi
+else ifeq ($(ARCH), wasm32)
+	TARGET_TRIPLE = wasm32-wasi
+else ifeq ($(ARCH), wasm64)
+    TARGET_TRIPLE = wasm64-wasi
+endif
 
 # Threaded version necessitates a different target, as objects from different
 # targets can't be mixed together while linking.
