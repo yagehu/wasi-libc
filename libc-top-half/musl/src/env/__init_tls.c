@@ -53,11 +53,19 @@ static inline struct stack_bounds get_stack_bounds()
 		 */
 #if !defined(__pic__)
 		unsigned char *sp;
+#if defined(__wasm32__)
 		__asm__(
 			".globaltype __stack_pointer, i32\n"
 			"global.get __stack_pointer\n"
 			"local.set %0\n"
 			: "=r"(sp));
+#elif defined(__wasm64__)
+		__asm__(
+			".globaltype __stack_pointer, i64\n"
+			"global.get __stack_pointer\n"
+			"local.set %0\n"
+			: "=r"(sp));
+#endif
 		if (sp > &__global_base) {
 			bounds.base = &__heap_base;
 			bounds.size = &__heap_base - &__data_end;

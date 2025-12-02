@@ -33,13 +33,16 @@ BUILD_LIBC_TOP_HALF ?= yes
 BUILD_LIBSETJMP ?= yes
 
 ifndef ARCH
-	# Set the default WASI target triple.
-	TARGET_TRIPLE ?= wasm32-wasi
+    # Set the default WASI target triple.
+    TARGET_TRIPLE ?= wasm32-wasi
+    ARCH = wasm32
 else ifeq ($(ARCH), wasm32)
-	TARGET_TRIPLE = wasm32-wasi
+    TARGET_TRIPLE ?= wasm32-wasi
 else ifeq ($(ARCH), wasm64)
-    TARGET_TRIPLE = wasm64-wasi
+    TARGET_TRIPLE ?= wasm64-wasip1
 endif
+
+export ARCH
 
 # Threaded version necessitates a different target, as objects from different
 # targets can't be mixed together while linking.
@@ -666,6 +669,7 @@ $(SYSROOT_LIB)/libc.so: $(OBJDIR)/libc.so.a $(BUILTINS_LIB_PATH)
 	$(BUILTINS_LIB_PATH) \
 	$(EXTRA_CFLAGS) $(LDFLAGS)
 
+
 # Note that unlike `libc.so` above this rule does not pass `-nodefaultlibs`
 # which means that libc will be linked by default. Additionally clang will try
 # to find, locate, and link compiler-rt. To get compiler-rt to work a
@@ -792,7 +796,7 @@ $(STARTUP_FILES) $(LIBC_BOTTOM_HALF_ALL_OBJS) $(LIBC_BOTTOM_HALF_ALL_SO_OBJS): C
 $(LIBC_TOP_HALF_ALL_OBJS) $(LIBC_TOP_HALF_ALL_SO_OBJS) $(MUSL_PRINTSCAN_LONG_DOUBLE_OBJS) $(MUSL_PRINTSCAN_LONG_DOUBLE_SO_OBJS) $(MUSL_PRINTSCAN_NO_FLOATING_POINT_OBJS) $(LIBWASI_EMULATED_SIGNAL_MUSL_OBJS) $(LIBWASI_EMULATED_SIGNAL_MUSL_SO_OBJS) $(LIBDL_OBJS) $(LIBDL_SO_OBJS) $(LIBSETJMP_OBJS) $(LIBSETJMP_SO_OBJS): CFLAGS += \
     -I$(LIBC_TOP_HALF_MUSL_SRC_DIR)/include \
     -I$(LIBC_TOP_HALF_MUSL_SRC_DIR)/internal \
-    -I$(LIBC_TOP_HALF_MUSL_DIR)/arch/wasm32 \
+    $(if $(filter wasm32,$(ARCH)),-I$(LIBC_TOP_HALF_MUSL_DIR)/arch/wasm32,-I$(LIBC_TOP_HALF_MUSL_DIR)/arch/wasm64) \
     -I$(LIBC_TOP_HALF_MUSL_DIR)/arch/generic \
     -I$(LIBC_TOP_HALF_HEADERS_PRIVATE) \
     -Wno-parentheses \
