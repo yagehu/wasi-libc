@@ -1,4 +1,5 @@
 #include <__macro_PAGESIZE.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -31,13 +32,15 @@ int main(void) {
 
         // The character is found if it's within range.
         char *want = NULL;
-        if (length > 0) want = 0 <= pos && pos < length ? &ptr[pos] : ptr;
+        if (length > 0)
+          want = 0 <= pos && pos < length ? &ptr[pos] : ptr;
         test(ptr, want);
       }
     }
 
     // We need space for the terminator.
-    if (length <= 1) continue;
+    if (length <= 1)
+      continue;
 
     // Ensure we never read past the end of memory.
     char *ptr = LIMIT - length;

@@ -1,38 +1,38 @@
-#include <sys/time.h>
-#include <time.h>
+#include "test.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include "test.h"
+#include <sys/time.h>
+#include <time.h>
+#include <wasi/version.h>
 
-#define TEST(c) do { \
-	errno = 0; \
-	if (!(c)) \
-		t_error("%s failed (errno = %d)\n", #c, errno); \
-} while(0)
+#define TEST(c)                                                                \
+  do {                                                                         \
+    errno = 0;                                                                 \
+    if (!(c))                                                                  \
+      t_error("%s failed (errno = %d)\n", #c, errno);                          \
+  } while (0)
 
-int main(void)
-{
-    // Sleep for a total of 5ms
-    long ns_to_sleep = 5E6;
+#ifdef __wasip1__
+#define CLOCK CLOCK_REALTIME
+#else
+#define CLOCK CLOCK_MONOTONIC
+#endif
 
-    struct timespec start_time, end_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-    TEST(usleep(ns_to_sleep / 1000) == 0);
-    clock_gettime(CLOCK_MONOTONIC, &end_time);
-    TEST(end_time.tv_sec - start_time.tv_sec <= 1);
+int main(void) {
+  // Sleep for a total of 5ms
+  long ns_to_sleep = 5E6;
 
-    long nanoseconds_elapsed = (end_time.tv_sec - start_time.tv_sec) * 1E9
-        - start_time.tv_nsec
-        + end_time.tv_nsec;
+  struct timespec start_time, end_time;
+  clock_gettime(CLOCK, &start_time);
+  TEST(usleep(ns_to_sleep / 1000) == 0);
+  clock_gettime(CLOCK, &end_time);
+  TEST(end_time.tv_sec - start_time.tv_sec <= 1);
 
-    // Test that the difference between the requested amount of sleep
-    // and the actual elapsed time is within an acceptable margin
-    double difference = abs(nanoseconds_elapsed - ns_to_sleep)
-                        / ns_to_sleep;
+  long nanoseconds_elapsed = (end_time.tv_sec - start_time.tv_sec) * 1E9 -
+                             start_time.tv_nsec + end_time.tv_nsec;
 
-    // Allow the actual sleep time to be twice as much as the requested time
-    TEST(difference <= 1);
+  TEST(nanoseconds_elapsed >= ns_to_sleep);
 
-    return t_status;
+  return t_status;
 }

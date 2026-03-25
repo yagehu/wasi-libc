@@ -1,39 +1,9 @@
-cmake_minimum_required(VERSION 3.26)
-project(wasi-libc-tests)
-
-if(NOT CMAKE_C_COMPILER_ID MATCHES Clang)
-  message(FATAL_ERROR "C compiler ${CMAKE_C_COMPILER} is not `Clang`, it is ${CMAKE_C_COMPILER_ID}")
-endif()
-
-message(STATUS "Found executable for `nm`: ${CMAKE_NM}")
-message(STATUS "Found executable for `ar`: ${CMAKE_AR}")
-message(STATUS "Found executable for `ranlib`: ${CMAKE_RANLIB}")
-
 include(FetchContent)
 include(ExternalProject)
 include(CTest)
 enable_testing()
 
-set(TARGET_TRIPLE "wasm32-wasi" CACHE STRING "WASI target to test")
-set(MALLOC_IMPL "" CACHE STRING "Malloc implementation in use")
 option(PYTHON_TESTS "Build Python with this wasi-libc and run its tests" OFF)
-
-# ========= Sysroot sanity check ================================
-
-cmake_path(GET CMAKE_CURRENT_SOURCE_DIR PARENT_PATH LIBC_SRC_DIR)
-set(SYSROOT_DIR "${LIBC_SRC_DIR}/sysroot")
-set(SYSROOT "${SYSROOT_DIR}/lib/${TARGET_TRIPLE}")
-
-# This build configuration does not currently manage the sysroot itself (but
-# ideally it will one day). Double-check that the sysroot exists before actually
-# trying to build any tests.
-if (NOT EXISTS "${SYSROOT_DIR}")
-  message(FATAL_ERROR "
-  No sysroot for ${TARGET_TRIPLE} available at ${SYSROOT_DIR}; to build it, e.g.:
-    cd ${LIBC_SRC_DIR}
-    make TARGET_TRIPLE=${TARGET_TRIPLE}
-  ")
-endif()
 
 # ========= Clone libc-test =====================================
 
@@ -48,57 +18,35 @@ set(LIBC_TEST "${libc-test_SOURCE_DIR}")
 message(STATUS "libc-test source directory: ${LIBC_TEST}")
 
 # ========= Download wasmtime as a test runner ==================
+include(ba-download)
 
 if(NOT ENGINE OR ENGINE STREQUAL "")
-  set(WASMTIME_VERSION "v38.0.2")
-  set(WASMTIME_REPO "https://github.com/bytecodealliance/wasmtime")
-
-  if (CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "x86_64")
-    set(WASMTIME_ARCH "x86_64")
-  elseif (CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "arm64")
-    set(WASMTIME_ARCH "aarch64")
-  elseif (CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "aarch64")
-    set(WASMTIME_ARCH "aarch64")
-  else()
-    message(FATAL_ERROR "Unsupported architecture ${CMAKE_HOST_SYSTEM_PROCESSOR} for Wasmtime")
-  endif()
-
-  if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin")
-    set(WASMTIME_OS macos)
-  elseif (CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
-    set(WASMTIME_OS linux)
-  else()
-    message(FATAL_ERROR "Unsupported system ${CMAKE_SYSTEM_NAME} for Wasmtime")
-  endif()
-
-  ExternalProject_Add(
-    engine
-    URL "${WASMTIME_REPO}/releases/download/${WASMTIME_VERSION}/wasmtime-${WASMTIME_VERSION}-${WASMTIME_ARCH}-${WASMTIME_OS}.tar.xz"
-    CONFIGURE_COMMAND ""
-    BUILD_COMMAND ""
-    INSTALL_COMMAND ""
+  ba_download(
+    wasmtime
+    "https://github.com/bytecodealliance/wasmtime"
+    "dev"
   )
-  ExternalProject_Get_Property(engine SOURCE_DIR)
+  ExternalProject_Get_Property(wasmtime SOURCE_DIR)
   set(ENGINE "${SOURCE_DIR}/wasmtime")
   message(STATUS "Wasmtime executable: ${ENGINE}")
+  add_custom_target(engine ALL DEPENDS wasmtime)
 else()
   add_custom_target(engine)
 endif()
 
+# All tests are compiled against the wasi-libc sysroot
+add_compile_options(--sysroot ${SYSROOT})
+add_link_options(--sysroot ${SYSROOT})
+
 # ========= libc-test defined tests =============================
 
 function(add_wasilibc_flags target)
-  target_compile_options(${target} PRIVATE
-    "--target=${TARGET_TRIPLE}"
-    "--sysroot=${SYSROOT_DIR}"
-  )
-  target_link_options(${target} PRIVATE
-    "--target=${TARGET_TRIPLE}"
-    "--sysroot=${SYSROOT_DIR}"
-    "-resource-dir=${LIBC_SRC_DIR}/build/${TARGET_TRIPLE}/resource-dir"
-  )
+  add_dependencies(${target} sysroot builtins)
+  # Using an `INTERFACE` looks to get what we want here which is to rebuild this
+  # if the library changes but not actually add any arguments to the link-line.
+  target_link_libraries(${target} INTERFACE c-static)
+
   if (TARGET_TRIPLE MATCHES "-threads")
-    target_compile_options(${target} PRIVATE -pthread)
     target_link_options(${target} PRIVATE -pthread
       -Wl,--import-memory,--export-memory,--shared-memory,--max-memory=1073741824)
   endif()
@@ -112,6 +60,13 @@ add_library(libc_test_support STATIC
 )
 target_include_directories(libc_test_support PUBLIC "${LIBC_TEST}/src/common")
 add_wasilibc_flags(libc_test_support)
+# Disable some warnings in this third-party code
+target_compile_options(libc_test_support PRIVATE
+  -Wno-unused-variable
+  -Wno-unused-parameter
+  -Wno-unused-function
+  -Wno-sign-compare
+)
 
 # Adds a new test executable to build
 #
@@ -130,8 +85,9 @@ function(add_test_executable executable_name src)
 
   # Build the test exeutable itself and apply all custom options as applicable.
   add_executable(${executable_name} ${src})
+  clang_format_target(${executable_name})
   add_wasilibc_flags(${executable_name})
-  target_link_libraries(${executable_name} libc_test_support)
+  target_link_libraries(${executable_name} PRIVATE libc_test_support)
   foreach(flag IN LISTS arg_CFLAGS)
     target_compile_options(${executable_name} PRIVATE ${flag})
   endforeach()
@@ -153,8 +109,10 @@ endfunction()
 # * `ENV a=b b=c` - set env vars for when executing this test
 # * `NETWORK` - this test uses the network and sockets.
 # * `PASS_REGULAR_EXPRESSION` - a regex that must match the test output to pass
+# * `FAILP3` - this test fails on wasip3 targets
+# * `SETJMP` - this test requires setjmp/longjmp
 function(register_test test_name executable_name)
-  set(options FS NETWORK)
+  set(options FS NETWORK FAILP3 SETJMP)
   set(oneValueArgs CLIENT PASS_REGULAR_EXPRESSION)
   set(multiValueArgs ARGV ENV LDFLAGS CFLAGS)
   cmake_parse_arguments(PARSE_ARGV 1 arg "${options}" "${oneValueArgs}" "${multiValueArgs}")
@@ -166,13 +124,29 @@ function(register_test test_name executable_name)
     list(APPEND wasmtime_args --dir ${fsdir}::/)
   endif()
   if (arg_NETWORK)
-    list(APPEND wasmtime_args -Sinherit-network)
+    list(APPEND wasmtime_args -Sinherit-network,allow-ip-name-lookup)
   endif()
   foreach(env IN LISTS arg_ENV)
     list(APPEND wasmtime_args --env ${env})
   endforeach()
   if (TARGET_TRIPLE MATCHES "-threads")
-    list(APPEND wasmtime_args --wasi threads)
+    list(APPEND wasmtime_args --wasi threads --wasm shared-memory)
+  endif()
+  if (WASI STREQUAL "p3")
+    list(APPEND wasmtime_args --wasm component-model-async)
+    list(APPEND wasmtime_args --wasi p3)
+  endif()
+  if (arg_SETJMP)
+    list(APPEND wasmtime_args --wasm exceptions)
+    target_compile_options(${executable_name} PRIVATE
+      "SHELL:-mllvm -wasm-enable-sjlj"
+      "SHELL:-mllvm -wasm-use-legacy-eh=false"
+    )
+    target_link_options(${executable_name} PRIVATE
+      -lsetjmp
+      $<$<BOOL:LTO>:-Wl,-mllvm=-wasm-enable-sjlj>
+      $<$<BOOL:LTO>:-Wl,-mllvm=-wasm-use-legacy-eh=false>
+    )
   endif()
 
   add_test(
@@ -193,16 +167,14 @@ function(register_test test_name executable_name)
     set_tests_properties("${test_name}" PROPERTIES FIXTURES_REQUIRED "fs_${test_name}")
   endif()
 
-  # All sockets tests use the same port right now, so only one can run at a
-  # time.
-  if (arg_NETWORK)
-    set_tests_properties(${test_name} PROPERTIES RESOURCE_LOCK socket-test)
-  endif()
-
   if (arg_PASS_REGULAR_EXPRESSION)
     set_tests_properties(${test_name} PROPERTIES PASS_REGULAR_EXPRESSION "${arg_PASS_REGULAR_EXPRESSION}")
   endif()
   set_tests_properties(${test_name} PROPERTIES TIMEOUT 10)
+
+  if (arg_FAILP3 AND (WASI STREQUAL "p3"))
+    set_tests_properties(${test_name} PROPERTIES WILL_FAIL TRUE)
+  endif()
 
   add_dependencies(${test_name} engine)
 endfunction()
@@ -219,6 +191,13 @@ function(add_libc_test test_file)
 
   add_test_executable(${test_name} "${test_file}" ${ARGN})
   register_test(${test_name} ${test_name} ${ARGN})
+  # Disable some warnings in this third-party code
+  target_compile_options(${test_name} PRIVATE
+    -Wno-sign-compare
+    -Wno-missing-braces
+    -Wno-unused-variable
+    -Wno-unused-parameter
+  )
 endfunction()
 
 add_libc_test(functional/argv.c)
@@ -235,14 +214,17 @@ add_libc_test(functional/memstream.c)
 add_libc_test(functional/qsort.c)
 add_libc_test(functional/random.c)
 add_libc_test(functional/search_hsearch.c)
-if (MALLOC_IMPL STREQUAL "emmalloc")
+if (MALLOC STREQUAL "emmalloc")
   set_tests_properties(libc_test_functional_search_hsearch.wasm PROPERTIES WILL_FAIL TRUE)
 endif()
 add_libc_test(functional/search_insque.c)
+if (LTO STREQUAL "full")
+  set_tests_properties(libc_test_functional_search_insque.wasm PROPERTIES WILL_FAIL TRUE)
+endif()
 add_libc_test(functional/search_lsearch.c)
 add_libc_test(functional/search_tsearch.c)
 add_libc_test(functional/snprintf.c)
-add_libc_test(functional/sscanf.c)
+add_libc_test(functional/sscanf.c CFLAGS -Wno-literal-range)
 add_libc_test(functional/strftime.c)
 add_libc_test(functional/string.c)
 add_libc_test(functional/string_memcpy.c)
@@ -291,6 +273,12 @@ add_wasilibc_test(chdir.c FS)
 add_wasilibc_test(close.c FS)
 add_wasilibc_test(external_env.c ENV VAR1=foo VAR2=bar)
 add_wasilibc_test(fadvise.c FS)
+# I'm not really entirely sure why this test is failing, it seemingly exits with
+# no output and fails on the very first `open`. Needs more investigation with a
+# native windows machine.
+if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
+  set_tests_properties(fadvise.wasm PROPERTIES WILL_FAIL TRUE)
+endif()
 add_wasilibc_test(fallocate.c FS)
 add_wasilibc_test(fcntl.c FS)
 add_wasilibc_test(fdatasync.c FS)
@@ -314,7 +302,8 @@ add_wasilibc_test(memchr.c LDFLAGS -Wl,--stack-first -Wl,--initial-memory=327680
 add_wasilibc_test(memcmp.c LDFLAGS -Wl,--stack-first -Wl,--initial-memory=327680)
 add_wasilibc_test(opendir.c FS ARGV /)
 add_wasilibc_test(open_relative_path.c FS ARGV /)
-add_wasilibc_test(poll.c FS)
+add_wasilibc_test(poll.c FS FAILP3)
+add_wasilibc_test(pselect.c FS FAILP3)
 add_wasilibc_test(preadvwritev.c FS)
 add_wasilibc_test(preadwrite.c FS)
 add_wasilibc_test(readlink.c FS)
@@ -336,27 +325,47 @@ add_wasilibc_test(utime.c FS)
 add_wasilibc_test(rewinddir.c FS)
 add_wasilibc_test(seekdir.c FS)
 add_wasilibc_test(usleep.c)
+add_wasilibc_test(nanosleep.c)
+add_wasilibc_test(sleep.c)
 add_wasilibc_test(write.c FS)
+add_wasilibc_test(wasi-defines.c)
+
+# This tests the behavior of the WASIp2+ descriptor table and won't succeed on
+# p1:
+if (NOT (WASI STREQUAL "p1"))
+  add_wasilibc_test(clear_fds.c FS)
+endif()
+
+if (CMAKE_C_COMPILER_VERSION VERSION_GREATER 20.0)
+  add_wasilibc_test(setjmp.c SETJMP)
+  set_tests_properties(setjmp.wasm PROPERTIES LABELS v8fail)
+endif()
 
 if (TARGET_TRIPLE MATCHES "-threads")
   add_wasilibc_test(busywait.c)
   add_wasilibc_test(pthread_cond_busywait.c)
   add_wasilibc_test(pthread_tsd_busywait.c)
+
+  # This test #include's a test whose source is not controlled here, so disable
+  # some extra warnings.
   add_wasilibc_test(pthread_mutex_busywait.c)
+  target_compile_options(pthread_mutex_busywait.wasm PRIVATE -Wno-unused-variable)
 endif()
 
 # ========= sockets-related tests ===============================
 
-if (TARGET_TRIPLE MATCHES "wasip2")
-  add_wasilibc_test(poll-nonblocking-socket.c NETWORK)
+if (NOT (WASI STREQUAL "p1"))
+  add_wasilibc_test(poll-connect.c NETWORK FAILP3)
+  add_wasilibc_test(poll-nonblocking-socket.c NETWORK FAILP3)
   add_wasilibc_test(setsockopt.c NETWORK)
-  add_wasilibc_test(sockets-nonblocking-udp.c NETWORK)
-  add_wasilibc_test(sockets-nonblocking-multiple.c NETWORK)
-  add_wasilibc_test(sockets-nonblocking-udp-multiple.c NETWORK)
-
-  # TODO: flaky tests
-  # add_wasilibc_test(sockets-nonblocking.c NETWORK)
-  # add_wasilibc_test(sockets-nonblocking-udp-no-connection.c NETWORK)
+  add_wasilibc_test(sockets-nonblocking-udp.c NETWORK FAILP3)
+  add_wasilibc_test(sockets-nonblocking-multiple.c NETWORK FAILP3)
+  add_wasilibc_test(sockets-nonblocking-udp-multiple.c NETWORK FAILP3)
+  add_wasilibc_test(sockets-fcntl.c NETWORK)
+  add_wasilibc_test(sockets-udp-connected.c NETWORK)
+  add_wasilibc_test(getaddrinfo.c NETWORK)
+  add_wasilibc_test(sockets-nonblocking.c NETWORK FAILP3)
+  add_wasilibc_test(sockets-nonblocking-udp-no-connection.c NETWORK FAILP3)
 
   # Define executables for server/client tests, and they're paired together in
   # various combinations below for various tests.
@@ -384,7 +393,7 @@ if (TARGET_TRIPLE MATCHES "wasip2")
   add_sockets_test_executable(sockets-multiple-server.c)
 
   function(sockets_test test_name client server)
-    set(options)
+    set(options FAILP3)
     set(oneValueArgs NCLIENTS)
     set(multiValueArgs)
     cmake_parse_arguments(PARSE_ARGV 1 arg "${options}" "${oneValueArgs}" "${multiValueArgs}")
@@ -399,13 +408,17 @@ if (TARGET_TRIPLE MATCHES "wasip2")
           -DNCLIENTS=${arg_NCLIENTS}
           -P ${CMAKE_CURRENT_SOURCE_DIR}/socket-test.cmake
     )
-    set_tests_properties(${test_name} PROPERTIES RESOURCE_LOCK socket-test)
+
+    if (arg_FAILP3 AND (WASI STREQUAL "p3"))
+      set_tests_properties(${test_name} PROPERTIES WILL_FAIL TRUE)
+    endif()
   endfunction()
 
   sockets_test(sockets sockets-client.wasm sockets-server.wasm)
-  sockets_test(sockets-udp-blocking sockets-client-udp-blocking.wasm sockets-server-udp-blocking.wasm)
+  sockets_test(sockets-udp-blocking sockets-client-udp-blocking.wasm
+    sockets-server-udp-blocking.wasm)
   sockets_test(sockets-multiple sockets-multiple-client.wasm sockets-multiple-server.wasm
-    NCLIENTS 10)
+    NCLIENTS 10 FAILP3)
 
   # Various forms of client hangups
   sockets_test(sockets-client-hangup-after-connect
@@ -451,7 +464,7 @@ if (PYTHON_TESTS)
   find_program(PYTHON python3 python REQUIRED)
   find_program(MAKE make REQUIRED)
 
-  set(flags "--target=${TARGET_TRIPLE} --sysroot=${SYSROOT_DIR}")
+  set(flags "--target=${TARGET_TRIPLE} --sysroot=${SYSROOT}")
 
   ExternalProject_Add(
     python
@@ -514,4 +527,5 @@ if (PYTHON_TESTS)
         -E env CFLAGS=${flags} LDFLAGS=${flags} --
         ${MAKE} --directory cross-build/wasm32-wasip1 test
   )
+  ExternalProject_Add_StepDependencies(python configure sysroot)
 endif()

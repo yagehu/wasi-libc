@@ -2,33 +2,48 @@
 //
 // SPDX-License-Identifier: BSD-2-Clause
 
-#include <wasi/api.h>
 #include <errno.h>
 #include <poll.h>
 #include <stdbool.h>
-
-#ifdef __wasilibc_use_wasip2
+#include <wasi/api.h>
 #include <wasi/descriptor_table.h>
+#include <wasi/file_utils.h>
 
-int poll_wasip2(struct pollfd *fds, size_t nfds, int timeout);
-
-int poll(struct pollfd* fds, nfds_t nfds, int timeout)
-{
-    return poll_wasip2(fds, nfds, timeout);
-}
-#else // not __wasilibc_use_wasip2
-
-static int poll_wasip1(struct pollfd *fds, size_t nfds, int timeout) {
+#if defined(__wasip1__)
+static int poll_impl(struct pollfd *fds, size_t nfds, int timeout) {
   // Construct events for poll().
   size_t maxevents = 2 * nfds + 1;
   __wasi_subscription_t subscriptions[maxevents];
   size_t nsubscriptions = 0;
+
+  // POLLPRI (exceptional/out-of-band data) is not supported in WASI.
+  // If all requested events across all fds are POLLPRI, return ENOSYS.
+  // Otherwise, remove POLLPRI so it never fires (same as no OOB data).
+  {
+    bool has_pri_only = false;
+    bool has_non_pri = false;
+    for (size_t i = 0; i < nfds; ++i) {
+      if (fds[i].fd < 0 || fds[i].events == 0)
+        continue;
+      if (fds[i].events & ~POLLPRI)
+        has_non_pri = true;
+      else
+        has_pri_only = true;
+    }
+    if (has_pri_only && !has_non_pri) {
+      errno = ENOSYS;
+      return -1;
+    }
+  }
+
   for (size_t i = 0; i < nfds; ++i) {
     struct pollfd *pollfd = &fds[i];
     if (pollfd->fd < 0)
       continue;
+    // Strip POLLPRI as it is never reported in WASI.
+    short events = pollfd->events & ~POLLPRI;
     bool created_events = false;
-    if ((pollfd->events & POLLRDNORM) != 0) {
+    if ((events & POLLRDNORM) != 0) {
       __wasi_subscription_t *subscription = &subscriptions[nsubscriptions++];
       *subscription = (__wasi_subscription_t){
           .userdata = (uintptr_t)pollfd,
@@ -37,7 +52,7 @@ static int poll_wasip1(struct pollfd *fds, size_t nfds, int timeout) {
       };
       created_events = true;
     }
-    if ((pollfd->events & POLLWRNORM) != 0) {
+    if ((events & POLLWRNORM) != 0) {
       __wasi_subscription_t *subscription = &subscriptions[nsubscriptions++];
       *subscription = (__wasi_subscription_t){
           .userdata = (uintptr_t)pollfd,
@@ -50,8 +65,9 @@ static int poll_wasip1(struct pollfd *fds, size_t nfds, int timeout) {
     // As entries are decomposed into separate read/write subscriptions,
     // we cannot detect POLLERR, POLLHUP and POLLNVAL if POLLRDNORM and
     // POLLWRNORM are not specified. Disallow this for now.
-    // Ignore fd entries that have no events requested.
-    if (!created_events && pollfd->events != 0) {
+    // Ignore fd entries that have no events requested (including
+    // entries that only had POLLPRI which was stripped above).
+    if (!created_events && events != 0) {
       errno = ENOSYS;
       return -1;
     }
@@ -140,8 +156,192 @@ static int poll_wasip1(struct pollfd *fds, size_t nfds, int timeout) {
   return retval;
 }
 
-int poll(struct pollfd* fds, nfds_t nfds, int timeout)
-{
-    return poll_wasip1(fds, nfds, timeout);
+#elif defined(__wasip2__)
+
+typedef struct {
+  struct pollfd *pollfd;
+  short events;
+} state_t;
+
+struct poll_state_t {
+  state_t *states;
+  poll_borrow_pollable_t *pollables;
+  size_t len;
+  size_t cap;
+
+  int event_count;
+  struct pollfd *pollfd;
+};
+
+int __wasilibc_poll_add(poll_state_t *state, short events,
+                        poll_borrow_pollable_t pollable) {
+  if (state->len >= state->cap) {
+    errno = ENOMEM;
+    return -1;
+  }
+  state->states[state->len].pollfd = state->pollfd;
+  state->states[state->len].events = events;
+  state->pollables[state->len] = pollable;
+  state->len += 1;
+  return 0;
 }
-#endif // not __wasilibc_use_wasip2
+
+void __wasilibc_poll_ready(poll_state_t *state, short events) {
+  if (events != 0) {
+    if (state->pollfd->revents == 0) {
+      ++state->event_count;
+    }
+    state->pollfd->revents |= events;
+  }
+}
+
+static int poll_impl(struct pollfd *fds, size_t nfds, int timeout) {
+  for (size_t i = 0; i < nfds; ++i) {
+    fds[i].revents = 0;
+  }
+
+  // POLLPRI (exceptional/out-of-band data) is not supported in WASI.
+  // If all requested events across all fds are exclusively POLLPRI,
+  // return ENOSYS. Otherwise, strip POLLPRI and proceed.
+  {
+    bool has_pri_only = false;
+    bool has_non_pri = false;
+    for (size_t i = 0; i < nfds; ++i) {
+      if (fds[i].fd < 0 || fds[i].events == 0)
+        continue;
+      if (fds[i].events & ~POLLPRI)
+        has_non_pri = true;
+      else
+        has_pri_only = true;
+    }
+    if (has_pri_only && !has_non_pri) {
+      errno = ENOSYS;
+      return -1;
+    }
+  }
+
+  size_t max_pollables = (2 * nfds) + 1;
+  state_t states[max_pollables];
+  poll_borrow_pollable_t pollables[max_pollables];
+
+  poll_state_t state;
+  state.states = states;
+  state.pollables = pollables;
+  state.len = 0;
+  state.cap = max_pollables;
+  state.event_count = 0;
+  state.pollfd = fds;
+
+  for (size_t i = 0; i < nfds; ++i) {
+    struct pollfd *pollfd = fds + i;
+    if (pollfd->fd < 0)
+      continue;
+    state.pollfd = pollfd;
+    descriptor_table_entry_t *entry = descriptor_table_get_ref(pollfd->fd);
+    if (!entry) {
+      errno = EBADF;
+      return -1;
+    }
+
+    // If this descriptor has a custom registration function then
+    // use that exclusively.
+    if (entry->vtable->poll_register) {
+      if (entry->vtable->poll_register(entry->data, &state, pollfd->events) < 0)
+        return -1;
+      continue;
+    }
+
+    // Strip POLLPRI, it is never reported in WASI (no OOB data).
+    short events = pollfd->events & ~POLLPRI;
+
+    // Without a custom registration handle read/write readiness
+    // below, but everything else is unsupported.
+    if (events & ~(POLLRDNORM | POLLWRNORM)) {
+      errno = EOPNOTSUPP;
+      return -1;
+    }
+
+    if (events & POLLRDNORM) {
+      if (entry->vtable->get_read_stream) {
+        wasi_read_t read;
+        if (entry->vtable->get_read_stream(entry->data, &read) < 0)
+          return -1;
+        if (__wasilibc_poll_add_input_stream(&state, read.input, read.pollable) < 0)
+          return -1;
+      } else {
+        errno = EOPNOTSUPP;
+        return -1;
+      }
+    }
+
+    if (events & POLLWRNORM) {
+      if (entry->vtable->get_write_stream) {
+        wasi_write_t write;
+        if (entry->vtable->get_write_stream(entry->data, &write) < 0)
+          return -1;
+        if (__wasilibc_poll_add_output_stream(&state, write.output, write.pollable) < 0)
+          return -1;
+      } else {
+        errno = EOPNOTSUPP;
+        return -1;
+      }
+    }
+  }
+
+  if (state.event_count > 0 && timeout != 0) {
+    return state.event_count;
+  }
+
+  poll_own_pollable_t timeout_pollable;
+  size_t pollable_count = state.len;
+  if (timeout >= 0) {
+    timeout_pollable = monotonic_clock_subscribe_duration(
+        ((monotonic_clock_duration_t)timeout) * 1000000);
+    pollables[pollable_count++] = poll_borrow_pollable(timeout_pollable);
+  }
+
+  wasip2_list_u32_t ready;
+  poll_list_borrow_pollable_t list = {.ptr = pollables, .len = pollable_count};
+  poll_poll(&list, &ready);
+
+  for (size_t i = 0; i < ready.len; ++i) {
+    size_t index = ready.ptr[i];
+    if (index >= state.len)
+      continue;
+    state_t *ready_state = &states[index];
+    state.pollfd = ready_state->pollfd;
+    descriptor_table_entry_t *entry =
+        descriptor_table_get_ref(ready_state->pollfd->fd);
+    if (entry->vtable->poll_finish) {
+      entry->vtable->poll_finish(entry->data, &state, ready_state->events);
+    } else {
+      __wasilibc_poll_ready(&state, ready_state->events);
+    }
+  }
+
+  wasip2_list_u32_free(&ready);
+
+  if (timeout >= 0) {
+    poll_pollable_drop_own(timeout_pollable);
+  }
+
+  return state.event_count;
+}
+
+#elif defined(__wasip3__)
+
+static int poll_impl(struct pollfd *fds, size_t nfds, int timeout) {
+  (void) fds;
+  (void) nfds;
+  (void) timeout;
+  errno = ENOTSUP;
+  return -1;
+}
+
+#else
+# error "Unknown WASI version"
+#endif
+
+int poll(struct pollfd* fds, nfds_t nfds, int timeout) {
+    return poll_impl(fds, nfds, timeout);
+}
